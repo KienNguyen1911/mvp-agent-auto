@@ -1,0 +1,35 @@
+{
+  "name": "orchestrator-bridge",
+  "version": "0.1.0",
+  "description": "Thin orchestration bridge connecting Codex CLI, AGY CLI, and OpenCode CLI",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "orchestrator-bridge": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/cli.ts",
+    "config": "tsx src/cli.ts --config",
+    "test": "tsx --test tests/**/*.test.ts",
+    "check": "tsx src/cli.ts check",
+    "status": "tsx src/cli.ts status",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "orchestrator",
+    "agent",
+    "codex",
+    "agy",
+    "opencode",
+    "bridge",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
