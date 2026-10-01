@@ -7,6 +7,11 @@ import {
   loadConfigFile,
   saveConfigFile,
   resolveModelConfig,
+  buildAgentChoices,
+  buildModelChoices,
+  findInitialModelIndex,
+  CUSTOM_MODEL_SENTINEL,
+  EXIT_SENTINEL,
 } from "../src/utils/config.js";
 
 const TEST_DIR = path.join(process.cwd(), ".tmp-config-test");
@@ -81,5 +86,41 @@ describe("Model Configuration Management", () => {
     assert.strictEqual(config.agy, "cli-agy-model");
     assert.strictEqual(config.opencode, "custom-opencode-model");
     assert.strictEqual(config.codex, "cli-codex-model");
+  });
+
+  test("buildAgentChoices exposes arrow-select options with exit sentinel", () => {
+    const choices = buildAgentChoices({
+      agy: "a",
+      opencode: "b",
+      codex: "c",
+    });
+    assert.strictEqual(choices.length, 4);
+    assert.deepStrictEqual(
+      choices.map((c) => c.value),
+      ["agy", "codex", "opencode", EXIT_SENTINEL]
+    );
+  });
+
+  test("buildModelChoices appends custom entry and marks current model", () => {
+    const models = ["m1", "m2", "m3"];
+    const choices = buildModelChoices(models, "m2", 15);
+    assert.strictEqual(choices.length, 4);
+    assert.strictEqual(choices[1].hint, "(Đang chọn)");
+    assert.strictEqual(choices[0].hint, undefined);
+    assert.strictEqual(choices[3].value, CUSTOM_MODEL_SENTINEL);
+  });
+
+  test("buildModelChoices respects displayCount limit", () => {
+    const models = ["m1", "m2", "m3", "m4"];
+    const choices = buildModelChoices(models, "m1", 2);
+    assert.strictEqual(choices.length, 3); // 2 models + custom
+    assert.strictEqual(choices[0].value, "m1");
+    assert.strictEqual(choices[1].value, "m2");
+  });
+
+  test("findInitialModelIndex highlights current model or falls back to 0", () => {
+    const choices = buildModelChoices(["m1", "m2"], "m2", 15);
+    assert.strictEqual(findInitialModelIndex(choices, "m2"), 1);
+    assert.strictEqual(findInitialModelIndex(choices, "unknown"), 0);
   });
 });

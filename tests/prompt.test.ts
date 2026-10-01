@@ -4,6 +4,10 @@ import {
   isShiftEnter,
   getStringVisualWidth,
   getPhysicalRowCount,
+  normalizeSelectIndex,
+  moveSelectIndex,
+  getSelectWindow,
+  promptSelect,
 } from "../src/utils/prompt.js";
 
 describe("Prompt Utilities & Key Detection", () => {
@@ -120,5 +124,104 @@ describe("Prompt Utilities & Key Detection", () => {
     assert.strictEqual(getPhysicalRowCount(userPrompt, 80), 2);
     // On 120 columns, it occupies 1 physical row.
     assert.strictEqual(getPhysicalRowCount(userPrompt, 120), 1);
+  });
+
+  test("normalizeSelectIndex clamps out-of-range indexes", () => {
+    assert.strictEqual(normalizeSelectIndex(0, 0), 0);
+    assert.strictEqual(normalizeSelectIndex(5, 0), 0);
+    assert.strictEqual(normalizeSelectIndex(-3, 5), 0);
+    assert.strictEqual(normalizeSelectIndex(0, 5), 0);
+    assert.strictEqual(normalizeSelectIndex(4, 5), 4);
+    assert.strictEqual(normalizeSelectIndex(5, 5), 4);
+    assert.strictEqual(normalizeSelectIndex(99, 5), 4);
+    assert.strictEqual(normalizeSelectIndex(NaN, 5), 0);
+  });
+
+  test("moveSelectIndex moves up/down with wrap-around", () => {
+    assert.strictEqual(moveSelectIndex(0, "down", 3), 1);
+    assert.strictEqual(moveSelectIndex(2, "down", 3), 0);
+    assert.strictEqual(moveSelectIndex(0, "up", 3), 2);
+    assert.strictEqual(moveSelectIndex(1, "up", 3), 0);
+    // Empty list stays at 0
+    assert.strictEqual(moveSelectIndex(0, "down", 0), 0);
+  });
+
+  test("moveSelectIndex respects wrap=false bounds clamping", () => {
+    assert.strictEqual(moveSelectIndex(2, "down", 3, false), 2);
+    assert.strictEqual(moveSelectIndex(0, "up", 3, false), 0);
+    assert.strictEqual(moveSelectIndex(1, "down", 3, false), 2);
+  });
+
+  test("getSelectWindow shows full list when it fits in pageSize", () => {
+    assert.deepStrictEqual(getSelectWindow(0, 5, 10), { start: 0, end: 5 });
+    assert.deepStrictEqual(getSelectWindow(4, 5, 10), { start: 0, end: 5 });
+  });
+
+  test("getSelectWindow scrolls to keep selection visible", () => {
+    const w0 = getSelectWindow(0, 20, 10);
+    assert.strictEqual(w0.start, 0);
+    assert.strictEqual(w0.end, 10);
+    // Selection near the end pins window to the bottom
+    assert.deepStrictEqual(getSelectWindow(19, 20, 10), { start: 10, end: 20 });
+    // Middle selection stays inside window
+    const mid = getSelectWindow(10, 20, 10);
+    assert.ok(mid.start <= 10 && 10 < mid.end);
+    assert.strictEqual(mid.end - mid.start, 10);
+    // Clamped selection also yields a valid window
+    const clamped = getSelectWindow(99, 20, 10);
+    assert.deepStrictEqual(clamped, { start: 10, end: 20 });
+  });
+
+  test("promptSelect returns null immediately for empty choices (no hang)", async () => {
+    const result = await promptSelect({ message: "empty", choices: [] });
+    assert.strictEqual(result, null);
+  });
+
+  test("promptSelect navigates with arrow keys and emits precise cursor movements", async () => {
+    const stream = await import("node:stream");
+    const inStream = new stream.PassThrough();
+    (inStream as any).isTTY = true;
+    (inStream as any).setRawMode = () => {};
+
+    let output = "";
+    const outStream = new stream.PassThrough();
+    (outStream as any).isTTY = true;
+    (outStream as any).columns = 80;
+    outStream.on("data", (d) => {
+      output += d.toString();
+    });
+
+    const origStdin = process.stdin;
+    const origStdout = process.stdout;
+    Object.defineProperty(process, "stdin", { value: inStream, configurable: true });
+    Object.defineProperty(process, "stdout", { value: outStream, configurable: true });
+
+    try {
+      const choices = [
+        { label: "Option A", value: "a" },
+        { label: "Option B", value: "b" },
+        { label: "Option C", value: "c" },
+      ];
+
+      const promise = promptSelect({
+        message: "Pick one",
+        choices,
+        initialIndex: 0,
+      });
+
+      // Send Down arrow, then Enter
+      setTimeout(() => inStream.write("\x1b[B"), 20);
+      setTimeout(() => inStream.write("\r"), 40);
+
+      const res = await promise;
+      assert.strictEqual(res, "b");
+
+      // Verify that re-render moved cursor up by the exact row count (4 rows)
+      const moveUps = output.match(/\x1b\[4A/g);
+      assert.ok(moveUps && moveUps.length >= 1, "Should move cursor up exactly 4 rows");
+    } finally {
+      Object.defineProperty(process, "stdin", { value: origStdin, configurable: true });
+      Object.defineProperty(process, "stdout", { value: origStdout, configurable: true });
+    }
   });
 });

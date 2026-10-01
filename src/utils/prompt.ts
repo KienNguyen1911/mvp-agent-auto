@@ -98,6 +98,311 @@ export function getPhysicalRowCount(formattedText: string, columns: number): num
 }
 
 /**
+ * ─────────────────────────────────────────────────────────────
+ * Interactive arrow-key selection (zero-dependency).
+ * Up/Down + Enter to pick an option, with non-TTY fallback.
+ * ─────────────────────────────────────────────────────────────
+ */
+
+export interface SelectChoice<T> {
+  label: string;
+  value: T;
+  hint?: string;
+}
+
+export interface PromptSelectOptions<T> {
+  message: string;
+  choices: Array<SelectChoice<T>>;
+  initialIndex?: number;
+  /** Max visible rows before scrolling. Defaults to 10. */
+  pageSize?: number;
+}
+
+/**
+ * Clamps an index into [0, length-1]. Returns 0 when list is empty.
+ * Pure helper — unit tested.
+ */
+export function normalizeSelectIndex(index: number, length: number): number {
+  if (length <= 0) return 0;
+  if (!Number.isFinite(index)) return 0;
+  if (index < 0) return 0;
+  if (index >= length) return length - 1;
+  return Math.trunc(index);
+}
+
+/**
+ * Moves a selection pointer one step up/down with wrap-around.
+ * Pure helper — unit tested.
+ */
+export function moveSelectIndex(
+  current: number,
+  direction: "up" | "down",
+  length: number,
+  wrap: boolean = true
+): number {
+  if (length <= 0) return 0;
+  const cur = normalizeSelectIndex(current, length);
+  if (direction === "down") {
+    const next = cur + 1;
+    if (next >= length) return wrap ? 0 : length - 1;
+    return next;
+  }
+  const prev = cur - 1;
+  if (prev < 0) return wrap ? length - 1 : 0;
+  return prev;
+}
+
+/**
+ * Computes the visible window [start, end) for a scrolling list so the
+ * selected row is always visible. Pure helper — unit tested.
+ */
+export function getSelectWindow(
+  selected: number,
+  total: number,
+  pageSize: number
+): { start: number; end: number } {
+  const size = Math.max(1, Math.trunc(pageSize) || 10);
+  if (total <= size) return { start: 0, end: total };
+  const sel = normalizeSelectIndex(selected, total);
+  // Keep selection roughly centered, biased to top for short lists.
+  let start = sel - Math.floor(size / 2);
+  if (start < 0) start = 0;
+  let end = start + size;
+  if (end > total) {
+    end = total;
+    start = end - size;
+  }
+  return { start, end };
+}
+
+/**
+ * Interactive single-select prompt.
+ * - TTY: Arrow Up/Down (or k/j) to move, Enter to confirm,
+ *   Esc / Ctrl+C to cancel (resolves null).
+ * - Non-TTY: numbered-list fallback via readline question.
+ * - Empty choices: resolves null immediately (no prompt).
+ */
+export async function promptSelect<T>(
+  options: PromptSelectOptions<T>
+): Promise<T | null> {
+  const { message, choices } = options;
+  if (!choices || choices.length === 0) return null;
+
+  const pageSize = Math.max(1, options.pageSize ?? 10);
+  const initial = normalizeSelectIndex(options.initialIndex ?? 0, choices.length);
+
+  const stdin = process.stdin as NodeJS.ReadStream & { setRawMode?: (m: boolean) => void };
+  const stdout = process.stdout;
+
+  const isTTY = Boolean(
+    stdin.isTTY && stdout.isTTY && typeof stdin.setRawMode === "function"
+  );
+  if (!isTTY) {
+    return promptSelectFallback(message, choices);
+  }
+
+  return new Promise<T | null>((resolve) => {
+    let selected = initial;
+    let renderedRows = 0;
+    let settled = false;
+
+    const hideCursor = "\x1B[?25l";
+    const showCursor = "\x1B[?25h";
+
+    const render = () => {
+      const cols = stdout.columns && stdout.columns > 0 ? stdout.columns : 80;
+
+      // Clear previously rendered rows.
+      if (renderedRows > 1) {
+        readline.moveCursor(stdout, 0, -(renderedRows - 1));
+      }
+      readline.cursorTo(stdout, 0);
+      readline.clearScreenDown(stdout);
+
+      const { start, end } = getSelectWindow(selected, choices.length, pageSize);
+      const lines: string[] = [];
+      lines.push(`? ${message}`);
+      lines.push(`  (↑↓ di chuyển • Enter chọn • Esc hủy)`);
+      if (choices.length > pageSize) {
+        lines.push(`  [${selected + 1}/${choices.length}]`);
+      }
+      for (let i = start; i < end; i++) {
+        const c = choices[i];
+        const isSel = i === selected;
+        const pointer = isSel ? "❯" : " ";
+        const hint = c.hint ? ` ${c.hint}` : "";
+        lines.push(`${pointer} ${c.label}${hint}`);
+      }
+      if (start > 0) lines.push(`  … (${start} mục phía trên)`);
+      if (end < choices.length) lines.push(`  … (${choices.length - end} mục phía dưới)`);
+
+      const fullOutput = lines.join("\n");
+      stdout.write(hideCursor + fullOutput);
+      renderedRows = getPhysicalRowCount(fullOutput, cols);
+    };
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKeypress);
+      try {
+        if (typeof stdin.setRawMode === "function") {
+          stdin.setRawMode(false);
+        }
+      } catch {
+        // ignore
+      }
+      stdout.write(showCursor);
+    };
+
+    const done = (value: T | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+
+      // Clear the rendered interactive menu
+      if (renderedRows > 1) {
+        readline.moveCursor(stdout, 0, -(renderedRows - 1));
+      }
+      readline.cursorTo(stdout, 0);
+      readline.clearScreenDown(stdout);
+
+      // Print clean summary line
+      if (value !== null) {
+        const choice = choices[selected];
+        stdout.write(`✔ ${message}: ${choice ? choice.label : String(value)}\n`);
+      } else {
+        stdout.write(`✖ ${message} (Đã hủy)\n`);
+      }
+
+      resolve(value);
+    };
+
+    const onKeypress = (_str: string, key: any) => {
+      if (!key) return;
+      // Ctrl+C → cancel
+      if (key.ctrl && key.name === "c") {
+        done(null);
+        return;
+      }
+      // Esc / Ctrl+[ → cancel
+      if (key.name === "escape" || key.sequence === "\x1b") {
+        done(null);
+        return;
+      }
+      if (key.name === "up" || key.name === "k") {
+        selected = moveSelectIndex(selected, "up", choices.length, true);
+        render();
+        return;
+      }
+      if (key.name === "down" || key.name === "j") {
+        selected = moveSelectIndex(selected, "down", choices.length, true);
+        render();
+        return;
+      }
+      // Page up/down for long lists
+      if (key.name === "pageup") {
+        for (let i = 0; i < pageSize; i++) {
+          selected = moveSelectIndex(selected, "up", choices.length, false);
+        }
+        render();
+        return;
+      }
+      if (key.name === "pagedown") {
+        for (let i = 0; i < pageSize; i++) {
+          selected = moveSelectIndex(selected, "down", choices.length, false);
+        }
+        render();
+        return;
+      }
+      if (key.name === "home") {
+        selected = 0;
+        render();
+        return;
+      }
+      if (key.name === "end") {
+        selected = choices.length - 1;
+        render();
+        return;
+      }
+      if (key.name === "return" || key.name === "enter") {
+        done(choices[selected].value);
+        return;
+      }
+      // Number shortcuts: pressing 1-9 jumps to that visible option
+      if (_str && /^[1-9]$/.test(_str)) {
+        const { start } = getSelectWindow(selected, choices.length, pageSize);
+        const idx = start + parseInt(_str, 10) - 1;
+        if (idx < choices.length) {
+          selected = idx;
+          render();
+        }
+        return;
+      }
+    };
+
+    render();
+
+    try {
+      stdin.setRawMode!(true);
+    } catch {
+      // If raw mode fails, fall back to numbered input.
+      cleanup();
+      promptSelectFallback(message, choices).then(resolve);
+      return;
+    }
+    stdin.resume();
+    readline.emitKeypressEvents(stdin);
+    process.stdin.on("keypress", onKeypress);
+  });
+}
+
+async function promptSelectFallback<T>(
+  message: string,
+  choices: Array<SelectChoice<T>>
+): Promise<T | null> {
+  choices.forEach((c, idx) => {
+    const hint = c.hint ? ` ${c.hint}` : "";
+    console.log(`  [${idx + 1}] ${c.label}${hint}`);
+  });
+  const answer = await askSimpleQuestion(
+    `👉 ${message} [1-${choices.length}]: `
+  );
+  if (answer === null) return null;
+  const trimmed = answer.trim();
+  if (trimmed === "") return null;
+  const num = parseInt(trimmed, 10);
+  if (!isNaN(num) && num >= 1 && num <= choices.length) {
+    return choices[num - 1].value;
+  }
+  // Allow typing the value/label directly for passthrough inputs.
+  const direct = choices.find(
+    (c) => String(c.value) === trimmed || c.label === trimmed
+  );
+  if (direct) return direct.value;
+  return null;
+}
+
+async function askSimpleQuestion(prompt: string): Promise<string | null> {
+  const mod = await import("node:readline/promises");
+  const rl = mod.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    return await rl.question(prompt);
+  } catch (err: any) {
+    if (err.code === "ERR_USE_AFTER_CLOSE" || err.message?.includes("closed")) {
+      return null;
+    }
+    throw err;
+  } finally {
+    try {
+      rl.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+/**
  * Prompts the user interactively in the terminal for a multiline objective.
  * Allows Shift+Enter (and Alt+Enter) to insert newlines, and Enter to submit.
  * Accurately calculates terminal line wrapping to prevent duplicate lines on long inputs.

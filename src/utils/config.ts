@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { promptSelect, type SelectChoice } from "./prompt.js";
 
 export interface AgentModelConfig {
   agy: string;
@@ -209,10 +210,62 @@ export async function fetchModelsForAgent(
   return [];
 }
 
-async function askQuestion(
-  rl: any,
-  prompt: string
-): Promise<string | null> {
+export const CUSTOM_MODEL_SENTINEL = "__custom__";
+export const EXIT_SENTINEL = "__exit__";
+
+export type ConfigAgent = "agy" | "codex" | "opencode";
+
+/**
+ * Builds agent choices for the interactive menu. Exported for testing.
+ */
+export function buildAgentChoices(current: AgentModelConfig): Array<SelectChoice<string>> {
+  return [
+    { label: `agy      (hiện tại: ${current.agy})`, value: "agy" },
+    { label: `codex    (hiện tại: ${current.codex})`, value: "codex" },
+    { label: `opencode (hiện tại: ${current.opencode})`, value: "opencode" },
+    { label: "Thoát (Lưu cấu hình)", value: EXIT_SENTINEL },
+  ];
+}
+
+/**
+ * Builds model choices including a custom-input entry. Exported for testing.
+ */
+export function buildModelChoices(
+  models: string[],
+  currentModel: string,
+  displayCount: number = 15
+): Array<SelectChoice<string>> {
+  const display = models.slice(0, Math.max(0, displayCount));
+  const choices: Array<SelectChoice<string>> = display.map((m) => ({
+    label: m,
+    value: m,
+    hint: m === currentModel ? "(Đang chọn)" : undefined,
+  }));
+  choices.push({
+    label: "✏️  Nhập tên model tùy chỉnh...",
+    value: CUSTOM_MODEL_SENTINEL,
+  });
+  return choices;
+}
+
+/**
+ * Finds the initial highlighted index for a model list (current model first).
+ * Exported for testing.
+ */
+export function findInitialModelIndex(
+  choices: Array<SelectChoice<string>>,
+  currentModel: string
+): number {
+  const idx = choices.findIndex((c) => c.value === currentModel);
+  return idx >= 0 ? idx : 0;
+}
+
+async function askQuestion(prompt: string): Promise<string | null> {
+  const readline = await import("node:readline/promises");
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
   try {
     return await rl.question(prompt);
   } catch (err: any) {
@@ -220,117 +273,93 @@ async function askQuestion(
       return null;
     }
     throw err;
+  } finally {
+    try {
+      rl.close();
+    } catch {
+      // ignore
+    }
   }
 }
 
 /**
  * Interactive menu to view current model configuration,
  * pick an agent, fetch its models, and save the chosen model.
+ * Uses arrow-key navigation (Up/Down + Enter) via promptSelect.
  */
 export async function interactiveConfigMenu(
   workdir: string = process.cwd()
 ): Promise<void> {
-  const readline = await import("node:readline/promises");
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  let running = true;
+  while (running) {
+    const currentConfig = await resolveModelConfig({ workdir });
 
-  try {
-    let running = true;
-    while (running) {
-      const currentConfig = await resolveModelConfig({ workdir });
-
-      console.log(`
+    console.log(`
 ┌─────────────────────────────────────────────────────────────┐
 │       ⚙️  CẤU HÌNH MODEL CHO CÁC AGENT (Orchestrator)        │
 └─────────────────────────────────────────────────────────────┘
 
 📋 Cấu hình model hiện tại:
-  1. agy:      ${currentConfig.agy}
-  2. codex:    ${currentConfig.codex}
-  3. opencode: ${currentConfig.opencode}
-  4. Thoát (Lưu cấu hình)
+   • agy:      ${currentConfig.agy}
+   • codex:    ${currentConfig.codex}
+   • opencode: ${currentConfig.opencode}
 `);
 
-      const answer = await askQuestion(
-        rl,
-        "👉 Chọn agent để thay đổi model [1-3] hoặc [4/q để thoát]: "
-      );
-      if (answer === null) {
-        break;
-      }
-      const choice = answer.trim();
+    const agentChoices = buildAgentChoices(currentConfig);
+    const agentAnswer = await promptSelect<string>({
+      message: "Chọn agent để thay đổi model",
+      choices: agentChoices,
+      initialIndex: 0,
+      pageSize: 10,
+    });
 
-      if (
-        choice === "4" ||
-        choice.toLowerCase() === "q" ||
-        choice.toLowerCase() === "exit"
-      ) {
-        console.log("\n✅ Cấu hình đã sẵn sàng. Bạn có thể chạy `npm start` bất cứ lúc nào!\n");
-        running = false;
-        break;
-      }
-
-      if (choice === "") {
-        continue;
-      }
-
-      let targetAgent: "agy" | "codex" | "opencode" | null = null;
-      if (choice === "1" || choice.toLowerCase() === "agy") targetAgent = "agy";
-      else if (choice === "2" || choice.toLowerCase() === "codex") targetAgent = "codex";
-      else if (choice === "3" || choice.toLowerCase() === "opencode") targetAgent = "opencode";
-
-      if (!targetAgent) {
-        console.log("⚠️ Lựa chọn không hợp lệ, vui lòng chọn từ 1 đến 4.");
-        continue;
-      }
-
-      console.log(`\n⏳ Đang fetch danh sách models khả dụng cho '${targetAgent}'...`);
-      const models = await fetchModelsForAgent(targetAgent, workdir);
-
-      const displayCount = Math.min(models.length, 15);
-      const displayModels = models.slice(0, displayCount);
-
-      console.log(`\n📦 Danh sách models cho '${targetAgent}':`);
-      displayModels.forEach((m, idx) => {
-        const isCurrent = m === currentConfig[targetAgent!];
-        console.log(`  [${idx + 1}] ${m}${isCurrent ? " (Đang chọn)" : ""}`);
-      });
-      console.log(`  [0] Nhập tên model tùy chỉnh khác\n`);
-
-      const modelAnswer = await askQuestion(
-        rl,
-        `👉 Chọn model cho '${targetAgent}' [1-${displayCount}] hoặc nhập tên: `
-      );
-      if (modelAnswer === null) {
-        break;
-      }
-      const modelChoice = modelAnswer.trim();
-
-      let selectedModel = "";
-      const num = parseInt(modelChoice, 10);
-      if (!isNaN(num) && num >= 1 && num <= displayCount) {
-        selectedModel = displayModels[num - 1];
-      } else if (modelChoice === "0") {
-        const customName = await askQuestion(rl, "👉 Nhập tên model tùy chỉnh: ");
-        selectedModel = customName ? customName.trim() : "";
-      } else if (modelChoice.length > 0) {
-        selectedModel = modelChoice;
-      }
-
-      if (selectedModel) {
-        await saveConfigFile(workdir, { [targetAgent]: selectedModel });
-        console.log(`\n✅ Đã lưu cấu hình: ${targetAgent} -> ${selectedModel}`);
-      } else {
-        console.log("\n⚠️ Không có thay đổi nào được lưu.");
-      }
+    if (agentAnswer === null || agentAnswer === EXIT_SENTINEL) {
+      console.log("\n✅ Cấu hình đã sẵn sàng. Bạn có thể chạy `npm start` bất cứ lúc nào!\n");
+      running = false;
+      break;
     }
-  } finally {
-    try {
-      rl.close();
-    } catch {
-      // ignore
+
+    // Back-compat: non-TTY fallback may return null on free-text; also
+    // accept legacy typed names if promptSelect passthrough is extended.
+    const targetAgent = agentAnswer as ConfigAgent;
+    if (targetAgent !== "agy" && targetAgent !== "codex" && targetAgent !== "opencode") {
+      console.log("⚠️ Lựa chọn không hợp lệ.");
+      continue;
+    }
+
+    console.log(`\n⏳ Đang fetch danh sách models khả dụng cho '${targetAgent}'...`);
+    const models = await fetchModelsForAgent(targetAgent, workdir);
+
+    const displayCount = Math.min(models.length, 15);
+    const modelChoices = buildModelChoices(models, currentConfig[targetAgent], displayCount);
+    const initialIndex = findInitialModelIndex(modelChoices, currentConfig[targetAgent]);
+
+    console.log(`\n📦 Danh sách models cho '${targetAgent}':`);
+    const picked = await promptSelect<string>({
+      message: `Chọn model cho '${targetAgent}' (↑↓ + Enter)`,
+      choices: modelChoices,
+      initialIndex,
+      pageSize: 10,
+    });
+
+    if (picked === null) {
+      console.log("\n↩️ Đã hủy chọn model, quay lại menu chính.");
+      continue;
+    }
+
+    let selectedModel = "";
+    if (picked === CUSTOM_MODEL_SENTINEL) {
+      const customName = await askQuestion("👉 Nhập tên model tùy chỉnh: ");
+      selectedModel = customName ? customName.trim() : "";
+    } else {
+      selectedModel = picked.trim();
+    }
+
+    if (selectedModel) {
+      await saveConfigFile(workdir, { [targetAgent]: selectedModel });
+      console.log(`\n✅ Đã lưu cấu hình: ${targetAgent} -> ${selectedModel}`);
+    } else {
+      console.log("\n⚠️ Không có thay đổi nào được lưu.");
     }
   }
 }
